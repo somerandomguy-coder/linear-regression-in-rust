@@ -1,5 +1,5 @@
 use anyhow::Result;
-use candle_core::{Device, Tensor};
+use candle_core::{Device, IndexOp, Tensor};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -18,10 +18,27 @@ struct LinearRegression {
     bias: Tensor,
     device: Device,
 }
+trait ZNormable {
+    fn z_norm(&self) -> Result<Tensor>;
+}
+impl ZNormable for Tensor {
+    fn z_norm(&self) -> Result<Tensor> {
+        let mean = self.mean(0)?;
+        println!("mean: {:}", mean);
+        let diff = self.broadcast_sub(&mean)?;
+        println!("diff: {:}", diff);
+        let variance = diff.sqr()?.mean(0)?;
+        println!("variance: {:}", variance);
+        let stdev = (variance + 1e-8)?.sqrt()?;
+        println!("stdev: {:}", stdev);
+
+        Ok(diff.broadcast_div(&stdev)?)
+    }
+}
 
 impl LinearRegression {
     fn new(features_size: usize, device: Device) -> Result<Self> {
-        let weights = Tensor::randn(0.0, 1.0, (1, features_size), &device)?;
+        let weights = Tensor::randn(0.0f32, 1.0f32, (features_size), &device)?;
         let bias = Tensor::new(0.0f32, &device)?;
 
         Ok(Self {
@@ -32,8 +49,11 @@ impl LinearRegression {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let tensor = Tensor::new(1, &self.device)?;
-        Ok(tensor)
+        let result = x
+            .matmul(&self.weights.unsqueeze(1)?)?
+            .squeeze(1)?
+            .broadcast_add(&self.bias)?;
+        Ok(result)
     }
 }
 
@@ -84,9 +104,6 @@ fn load_data(file_path: &str, device: &Device) -> Result<Tensor> {
         // println!("{:?}", row);
         dataset.extend(row);
     }
-    let row = dataset.len();
-    // println!("row: {:?}", row);
-    //
     // println!("dataset: {:?}", dataset);
 
     let tensor: Tensor = Tensor::from_vec(dataset, (1338, 10), device)?;
@@ -107,6 +124,12 @@ fn main() -> Result<()> {
     let columns = data.shape().dims2()?.1;
     println!("row: {:?}, columns: {:?}", rows, columns);
     let model = LinearRegression::new(columns, device)?;
+    let x = data.i(..3)?;
+    println!("x: {:}", x);
+    let norm_x = x.z_norm()?;
+    println!("norm_x: {:}", norm_x);
+    let result = model.forward(&norm_x);
+    println!("result: {:?}", result);
 
     // println!("model {:?}", model);
     Ok(())
