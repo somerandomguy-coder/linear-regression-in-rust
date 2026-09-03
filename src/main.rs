@@ -1,3 +1,5 @@
+use std::ops::Mul;
+
 use anyhow::Result;
 use candle_core::{Device, IndexOp, Tensor};
 use serde::Deserialize;
@@ -54,6 +56,40 @@ impl LinearRegression {
             .squeeze(1)?
             .broadcast_add(&self.bias)?;
         Ok(result)
+    }
+
+    fn loss(&self, pred: &Tensor, label: &Tensor) -> Result<f32> {
+        // MSE pred (batch, 1), (batch, 1) -> (1)
+        // MSE = (mean((pred-label)**2))
+        println!("prediction: {:}, label: {}", pred, label);
+        let loss = pred.sub(label)?.sqr()?;
+        let mean = loss.mean_all()?.to_scalar()?;
+        Ok(mean)
+    }
+    // mut self because we will change the weight
+    fn train_1_epoch(
+        &mut self,
+        x: &Tensor,
+        y: &Tensor,
+        learning_rate: f32,
+        regularization: f32,
+    ) -> Result<()> {
+        let batch_size = x.shape().dims2()?.0;
+        println!("batch_size: {:?}", batch_size);
+
+        let pred = self.forward(x)?;
+        println!("pred: {:?}", pred);
+
+        let loss = self.loss(&pred.unsqueeze(1)?, &y)?;
+        println!("loss: {:?}", loss);
+
+        let weight_sum = self.weights.sum_all()?.to_scalar::<f32>()?;
+        let weighted_sum = weight_sum / (batch_size as f32);
+        let regularize_term = weighted_sum.mul(regularization);
+
+        let loss_with_regular = loss + regularize_term;
+
+        Ok(())
     }
 }
 
@@ -114,22 +150,36 @@ fn main() -> Result<()> {
     println!("Hello, world!");
     println!("[CONFIG]");
     let device = Device::Cpu;
+    let lr = 1e-3;
+    let regularization = 1e-3;
     println!("device :{:?}", device);
+    println!("lr :{:?}", lr);
+    println!("regularization :{:?}", regularization);
     println!("[END OF CONFIG]");
     let data = load_data("src/insurance.csv", &device)?;
-
     println!("data {:?}", data);
 
-    let rows = data.shape().dims2()?.0;
-    let columns = data.shape().dims2()?.1;
+    let norm_data = data.z_norm()?;
+    println!("norm_data: {:}", norm_data);
+
+    let batch = norm_data.i(..3)?;
+    let x = batch.i((.., ..9))?;
+    let y = batch.i((.., 9..10))?;
+    println!("x: {:}, y: {:}", x, y);
+
+    let rows = x.shape().dims2()?.0;
+    let columns = x.shape().dims2()?.1;
     println!("row: {:?}, columns: {:?}", rows, columns);
-    let model = LinearRegression::new(columns, device)?;
-    let x = data.i(..3)?;
-    println!("x: {:}", x);
-    let norm_x = x.z_norm()?;
-    println!("norm_x: {:}", norm_x);
-    let result = model.forward(&norm_x);
+
+    let mut model = LinearRegression::new(columns, device)?;
+
+    model.train_1_epoch(&x, &y, lr, regularization)?;
+
+    let result = model.forward(&x)?;
     println!("result: {:?}", result);
+
+    let loss = model.loss(&result.unsqueeze(1)?, &y)?;
+    println!("loss: {:?}", loss);
 
     // println!("model {:?}", model);
     Ok(())
