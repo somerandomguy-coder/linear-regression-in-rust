@@ -40,7 +40,7 @@ impl ZNormable for Tensor {
 
 impl LinearRegression {
     fn new(features_size: usize, device: Device) -> Result<Self> {
-        let weights = Tensor::randn(0.0f32, 1.0f32, (features_size), &device)?;
+        let weights = Tensor::randn(0.0f32, 1.0f32, features_size, &device)?;
         let bias = Tensor::new(0.0f32, &device)?;
 
         Ok(Self {
@@ -48,6 +48,14 @@ impl LinearRegression {
             bias,
             device,
         })
+    }
+
+    fn clone(&self) -> Result<Self> {
+        //hardcord
+        let mut clone_model = LinearRegression::new(9, self.device.clone())?;
+        clone_model.weights = self.weights.clone();
+        clone_model.bias = self.bias.clone();
+        Ok(clone_model)
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -73,6 +81,7 @@ impl LinearRegression {
         y: &Tensor,
         learning_rate: f32,
         regularization: f32,
+        delta: f32,
     ) -> Result<()> {
         let batch_size = x.shape().dims2()?.0;
         println!("batch_size: {:?}", batch_size);
@@ -88,6 +97,28 @@ impl LinearRegression {
         let regularize_term = weighted_sum.mul(regularization);
 
         let loss_with_regular = loss + regularize_term;
+
+        //calculate gradient
+
+        let mut temp_model = self.clone()?;
+        temp_model.weights = temp_model
+            .weights
+            .broadcast_add(&Tensor::new(delta, &self.device)?)?;
+
+        let temp_loss = temp_model.loss(&temp_model.forward(x)?.unsqueeze(1)?, y)?;
+
+        let dw = (temp_loss - loss) / delta;
+
+        let mut temp_model = self.clone()?;
+        temp_model.bias = temp_model
+            .bias
+            .broadcast_add(&Tensor::new(delta, &self.device)?)?;
+
+        let temp_loss = temp_model.loss(&temp_model.forward(x)?.unsqueeze(1)?, y)?;
+
+        let db = (temp_loss - loss / delta);
+
+        // optimizer (vanilla gradient descent)
 
         Ok(())
     }
@@ -152,9 +183,11 @@ fn main() -> Result<()> {
     let device = Device::Cpu;
     let lr = 1e-3;
     let regularization = 1e-3;
+    let delta = 1e-5f32;
     println!("device :{:?}", device);
     println!("lr :{:?}", lr);
     println!("regularization :{:?}", regularization);
+    println!("delta :{:?}", delta);
     println!("[END OF CONFIG]");
     let data = load_data("src/insurance.csv", &device)?;
     println!("data {:?}", data);
@@ -173,7 +206,7 @@ fn main() -> Result<()> {
 
     let mut model = LinearRegression::new(columns, device)?;
 
-    model.train_1_epoch(&x, &y, lr, regularization)?;
+    model.train_1_epoch(&x, &y, lr, regularization, delta)?;
 
     let result = model.forward(&x)?;
     println!("result: {:?}", result);
