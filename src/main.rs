@@ -1,7 +1,5 @@
-use std::ops::Mul;
-
 use anyhow::Result;
-use candle_core::{Device, IndexOp, Tensor};
+use candle_core::{D, Device, IndexOp, Tensor};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -50,14 +48,6 @@ impl LinearRegression {
         })
     }
 
-    fn clone(&self) -> Result<Self> {
-        //hardcord
-        let mut clone_model = LinearRegression::new(9, self.device.clone())?;
-        clone_model.weights = self.weights.clone();
-        clone_model.bias = self.bias.clone();
-        Ok(clone_model)
-    }
-
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let result = x
             .matmul(&self.weights.unsqueeze(1)?)?
@@ -81,44 +71,44 @@ impl LinearRegression {
         y: &Tensor,
         learning_rate: f32,
         regularization: f32,
-        delta: f32,
     ) -> Result<()> {
         let batch_size = x.shape().dims2()?.0;
         println!("batch_size: {:?}", batch_size);
 
-        let pred = self.forward(x)?;
+        let pred = self.forward(x)?.unsqueeze(1)?;
         println!("pred: {:?}", pred);
 
-        let loss = self.loss(&pred.unsqueeze(1)?, &y)?;
-        println!("loss: {:?}", loss);
+        println!("first");
+        let deltas = pred.sub(y)?;
 
-        let weight_sum = self.weights.sum_all()?.to_scalar::<f32>()?;
-        let weighted_sum = weight_sum / (batch_size as f32);
-        let regularize_term = weighted_sum.mul(regularization);
+        let regularization = self.weights.broadcast_mul(&Tensor::new(
+            regularization / batch_size as f32,
+            &self.device,
+        )?)?;
+        println!("firstmatmul");
 
-        let loss_with_regular = loss + regularize_term;
+        // (x.T * (y^ - y))/m
+        let gradient = x
+            .t()?
+            .matmul(&deltas)?
+            .broadcast_div(&Tensor::new(batch_size as f32, &self.device)?)?;
 
-        //calculate gradient
+        let gradient = gradient
+            .squeeze(D::Minus1)?
+            .squeeze(D::Minus1)?
+            .add(&regularization)?;
 
-        let mut temp_model = self.clone()?;
-        temp_model.weights = temp_model
+        println!("second");
+        self.weights = self
             .weights
-            .broadcast_add(&Tensor::new(delta, &self.device)?)?;
+            .sub(&gradient.broadcast_mul(&Tensor::new(learning_rate, &self.device)?)?)?;
 
-        let temp_loss = temp_model.loss(&temp_model.forward(x)?.unsqueeze(1)?, y)?;
+        let gradient = deltas.mean(D::Minus1)?;
 
-        let dw = (temp_loss - loss) / delta;
-
-        let mut temp_model = self.clone()?;
-        temp_model.bias = temp_model
+        println!("third");
+        self.bias = self
             .bias
-            .broadcast_add(&Tensor::new(delta, &self.device)?)?;
-
-        let temp_loss = temp_model.loss(&temp_model.forward(x)?.unsqueeze(1)?, y)?;
-
-        let db = (temp_loss - loss / delta);
-
-        // optimizer (vanilla gradient descent)
+            .sub(&gradient.broadcast_mul(&Tensor::new(learning_rate, &self.device)?)?)?;
 
         Ok(())
     }
@@ -206,7 +196,7 @@ fn main() -> Result<()> {
 
     let mut model = LinearRegression::new(columns, device)?;
 
-    model.train_1_epoch(&x, &y, lr, regularization, delta)?;
+    model.train_1_epoch(&x, &y, lr, regularization)?;
 
     let result = model.forward(&x)?;
     println!("result: {:?}", result);
