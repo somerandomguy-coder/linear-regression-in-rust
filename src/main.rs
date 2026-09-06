@@ -1,5 +1,6 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use candle_core::{D, Device, IndexOp, Tensor};
+use nalgebra::DMatrix;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -32,6 +33,29 @@ impl ZNormable for Tensor {
     }
 }
 
+fn invert_tensor(a: &Tensor) -> Result<Tensor> {
+    let n = a.dim(0).context("Failed to get tensor dimension")?;
+
+    // 1. Pull data to CPU and parse into nalgebra
+    let flat_data = a.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
+    let matrix = DMatrix::from_row_slice(n, n, &flat_data);
+
+    // 2. Invert using nalgebra
+    let inv_matrix = matrix
+        .try_inverse()
+        .ok_or_else(|| anyhow::anyhow!("Matrix is singular and cannot be inverted"))?;
+
+    // 3. Extract the underlying slice directly
+    let inv_slice = inv_matrix.as_slice();
+
+    // 4. Create the tensor, transpose it, and target the original device
+    let result = Tensor::from_slice(inv_slice, (n, n), &Device::Cpu)?
+        .t()?
+        .to_device(a.device())?;
+
+    Ok(result)
+}
+
 impl LinearRegression {
     fn new(features_size: usize, device: Device) -> Result<Self> {
         let weights = Tensor::randn(0.0f32, 1.0f32, features_size, &device)?;
@@ -59,6 +83,25 @@ impl LinearRegression {
         let mean = loss.mean_all()?.to_scalar()?;
         Ok(mean)
     }
+
+    fn fit(&mut self, x: Tensor, y: Tensor) -> Result<()> {
+        let xm = x.mean_all()?;
+        let ym = y.mean_all()?;
+
+        let X = x.broadcast_sub(&xm)?;
+        let Y = y.broadcast_sub(&ym)?;
+
+        let first = X.t()?.matmul(&X)?;
+        let second = X.t()?.matmul(&Y);
+
+        let weight = first * second;
+
+        self.weights = x.clone();
+        self.bias = y.clone();
+
+        Ok(())
+    }
+
     // mut self because we will change the weight
     fn train_1_epoch(
         &mut self,
@@ -209,27 +252,32 @@ fn main() -> Result<()> {
 
     let mut model = LinearRegression::new(columns, device)?;
 
-    let test = norm_data.i(1200..1201)?;
-    let x_test = test.i((.., ..9))?;
-    let y_test = test.i((.., 9..10))?;
+    // backprop train
 
-    let pred = model.forward(&x_test)?.unsqueeze(1)?;
-    println!("y: {y_test}, prediction: {pred}");
-
-    let epochs = 1000;
-
-    for i in 0..epochs {
-        let loss = model.train_1_epoch(&x, &y, lr, regularization)?;
-        // print!("[EPOCH {i}]: ");
-        // println!("  loss: {}", loss);
-        if i % 100 == 0 {
-            let predictions = model.forward(&x)?.unsqueeze(1)?;
-            let r2 = r2_score(&predictions, &y)?;
-            println!("[EPOCH {i}] accuracy is {r2}, loss is {loss}");
-        }
-    }
+    // let test = norm_data.i(1200..1201)?;
+    // let x_test = test.i((.., ..9))?;
+    // let y_test = test.i((.., 9..10))?;
+    //
+    // let pred = model.forward(&x_test)?.unsqueeze(1)?;
+    // println!("y: {y_test}, prediction: {pred}");
+    //
+    // let epochs = 1000;
+    //
+    // for i in 0..epochs {
+    //     let loss = model.train_1_epoch(&x, &y, lr, regularization)?;
+    //     // print!("[EPOCH {i}]: ");
+    //     // println!("  loss: {}", loss);
+    //     if i % 100 == 0 {
+    //         let predictions = model.forward(&x)?.unsqueeze(1)?;
+    //         let r2 = r2_score(&predictions, &y)?;
+    //         println!("[EPOCH {i}] accuracy is {r2}, loss is {loss}");
+    //     }
+    // }
 
     // Test
+
+    // faster fit
+    model.fit(x, y)?;
 
     let batch = norm_data.i(1200..1201)?;
     let x = batch.i((.., ..9))?;
