@@ -1,5 +1,5 @@
-use anyhow::{Context, Result};
-use candle_core::{D, Device, IndexOp, Tensor};
+use anyhow::{Context, Result, bail};
+use candle_core::{D, Device, IndexOp, Tensor, quantized::GgmlDType::F32};
 use nalgebra::DMatrix;
 use serde::Deserialize;
 
@@ -34,23 +34,44 @@ impl ZNormable for Tensor {
 }
 
 fn invert_tensor(a: &Tensor) -> Result<Tensor> {
-    let n = a.dim(0).context("Failed to get tensor dimension")?;
+    // 1. Validate rank and square shape
+    let dims = a.dims();
+    if dims.len() != 2 {
+        bail!(
+            "Expected a 2D tensor, but got {}D shape: {:?}",
+            dims.len(),
+            dims
+        );
+    }
 
-    // 1. Pull data to CPU and parse into nalgebra
-    let flat_data = a.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
+    let (rows, cols) = (dims[0], dims[1]);
+    if rows != cols {
+        bail!(
+            "Matrix must be square to invert, got shape ({}, {})",
+            rows,
+            cols
+        );
+    }
+    let n = rows;
+
+    // 2. Pull data to CPU (flattened row-major slice)
+    let flat_data = a
+        .to_device(&Device::Cpu)?
+        .flatten_all()?
+        .to_vec1::<f32>()
+        .context("Failed to read tensor data as f32")?;
+
+    // 3. Construct nalgebra matrix and invert
     let matrix = DMatrix::from_row_slice(n, n, &flat_data);
-
-    // 2. Invert using nalgebra
     let inv_matrix = matrix
         .try_inverse()
         .ok_or_else(|| anyhow::anyhow!("Matrix is singular and cannot be inverted"))?;
 
-    // 3. Extract the underlying slice directly
-    let inv_slice = inv_matrix.as_slice();
-
-    // 4. Create the tensor, transpose it, and target the original device
-    let result = Tensor::from_slice(inv_slice, (n, n), &Device::Cpu)?
+    // 4. nalgebra stores data column-major internally, so `as_slice()` is column-major.
+    // Transposing the reconstructed tensor produces the correct row-major output.
+    let result = Tensor::from_slice(inv_matrix.as_slice(), (n, n), &Device::Cpu)?
         .t()?
+        .contiguous()?
         .to_device(a.device())?;
 
     Ok(result)
@@ -91,13 +112,25 @@ impl LinearRegression {
         let X = x.broadcast_sub(&xm)?;
         let Y = y.broadcast_sub(&ym)?;
 
-        let first = X.t()?.matmul(&X)?;
-        let second = X.t()?.matmul(&Y);
+        let batch_size = X.shape().dims2()?.0;
+        let dummy_one = Tensor::ones((batch_size, 1), candle_core::DType::F32, &self.device)?;
 
-        let weight = first * second;
+        let X = Tensor::cat(&[&X, &dummy_one], 1)?;
 
-        self.weights = x.clone();
-        self.bias = y.clone();
+        // first: (10x10)
+        let first = invert_tensor(&(X.t()?.matmul(&X)?))?;
+
+        // first: (10x1)
+        let second = X.t()?.matmul(&Y)?;
+
+        // weight = (10x1)
+        let weights = (first.matmul(&second))?;
+
+        let weight = weights.i((..9, ..))?;
+        let bias = weights.i((9..10, ..))?;
+
+        self.weights = weight.squeeze(1)?;
+        self.bias = bias.squeeze(1)?;
 
         Ok(())
     }
@@ -253,13 +286,14 @@ fn main() -> Result<()> {
     let mut model = LinearRegression::new(columns, device)?;
 
     // backprop train
+    println!("BEFORE TRAIN");
 
-    // let test = norm_data.i(1200..1201)?;
-    // let x_test = test.i((.., ..9))?;
-    // let y_test = test.i((.., 9..10))?;
-    //
-    // let pred = model.forward(&x_test)?.unsqueeze(1)?;
-    // println!("y: {y_test}, prediction: {pred}");
+    let test = norm_data.i(1200..1205)?;
+    let x_test = test.i((.., ..9))?;
+    let y_test = test.i((.., 9..10))?;
+
+    let pred = model.forward(&x_test)?.unsqueeze(1)?;
+    println!("y: {y_test},\n\nprediction: {pred}\n");
     //
     // let epochs = 1000;
     //
@@ -279,12 +313,14 @@ fn main() -> Result<()> {
     // faster fit
     model.fit(x, y)?;
 
-    let batch = norm_data.i(1200..1201)?;
+    println!("AFTER TRAIN");
+
+    let batch = norm_data.i(1200..1205)?;
     let x = batch.i((.., ..9))?;
     let y = batch.i((.., 9..10))?;
 
     let pred = model.forward(&x)?.unsqueeze(1)?;
-    println!("y: {y}, prediction: {pred}");
+    println!("y: {y},\n\nprediction: {pred}");
 
     Ok(())
 }
